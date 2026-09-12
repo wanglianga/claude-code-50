@@ -1,0 +1,66 @@
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*secret*
+*token*
+*credential*
+
+# Dependency and build output
+node_modules/
+dist/
+build/
+target/
+coverage/
+.cache/
+.parcel-cache/
+.vite/
+
+# Runtime data, logs, caches, and local databases
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.cache
+*.db
+*.sqlite
+*.sqlite3
+data/
+uploads/
+
+# Local editor and OS state
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Claude Code local state and exported trajectories
+.claude/
+CLAUDE.md
+claude*.jsonl
+*_traces/
+traces/
+sessions/
+
+# QA artifacts
+qa/
+QA/
+qa-*/
+*qa-report*
+playwright-report/
+test-results/
+screenshots/
+
+# Memory and skill files/directories
+memory/
+memories/
+skill/
+skills/
+SKILL.md
+MEMORY.md

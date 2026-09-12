@@ -1,0 +1,34 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:postgres}:${DB_PORT:5432}/${DB_NAME:nightpharmacy}
+    username: ${DB_USER:night}
+    password: ${DB_PASSWORD:nightpass}
+    hikari:
+      maximum-pool-size: 10
+      connection-timeout: 30000
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: true
+    properties:
+      hibernate:
+        format_sql: false
+    show-sql: false
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 20MB
+
+app:
+  night-fee-rate: 0.15        # 夜间服务费率（按药费）
+  night-fee-min: 6.00         # 夜间服务费最低 6 元
+  chronic-annual-quota: 4000  # 门诊慢病年度额度（元/人）
+  chronic-used-default: 1200  # 演示数据默认已用额度
+  storage-dir: /app/data/uploads
+
+logging:
+  level:
+    cn.nightpharmacy: INFO
