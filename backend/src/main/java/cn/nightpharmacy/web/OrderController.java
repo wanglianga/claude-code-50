@@ -128,6 +128,29 @@ public class OrderController extends BaseController {
         return ok(service.pay(u, id, req));
     }
 
+    // ---------------- 缺药替代协商 ----------------
+    @GetMapping("/{id}/items/{itemId}/candidates")
+    public Object candidates(@PathVariable Long id, @PathVariable Long itemId, HttpServletRequest r) {
+        User u = currentUser(r);
+        return Map.of("success", true, "data", service.substitutionCandidates(id, itemId, u));
+    }
+
+    @PostMapping("/{id}/negotiations")
+    public Object startNegotiation(@PathVariable Long id, @RequestBody NegotiateReq req, HttpServletRequest r) {
+        User u = currentUser(r);
+        requireRole(u, "PHARMACIST", "ADMIN");
+        return Map.of("success", true, "data", service.startNegotiation(u, id, req));
+    }
+
+    @PostMapping("/{id}/negotiations/{nid}/decision")
+    public Object negotiationDecision(@PathVariable Long id, @PathVariable Long nid,
+                                      @RequestBody NegotiationDecisionReq req, HttpServletRequest r) {
+        User u = currentUser(r);
+        // 患者本人确认，或客服经患者电话确认后代录
+        requireRole(u, "PATIENT", "CUSTOMER_SERVICE", "ADMIN");
+        return Map.of("success", true, "data", service.decideNegotiation(u, id, nid, req));
+    }
+
     // ---------------- 仓管：替代/缺药移除/出库 ----------------
     @PostMapping("/{id}/substitute")
     public Map<String, Object> substitute(@PathVariable Long id, @RequestBody SubstituteReq req,

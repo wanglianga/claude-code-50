@@ -31,6 +31,8 @@ public class OrderService {
     private final ShiftRepository shifts;
     private final ComplaintRepository complaints;
     private final InsuranceService insurance;
+    private final NegotiationRepository negotiations;
+    private final PharmacyRepository pharmacies;
 
     @Value("${app.night-fee-rate}") private BigDecimal nightFeeRate;
     @Value("${app.night-fee-min}") private BigDecimal nightFeeMin;
@@ -47,10 +49,12 @@ public class OrderService {
 
     public OrderService(OrderRepository orders, OrderItemRepository items, OrderEventRepository events,
                         DrugRepository drugs, UserRepository users, ShiftRepository shifts,
-                        ComplaintRepository complaints, InsuranceService insurance) {
+                        ComplaintRepository complaints, InsuranceService insurance,
+                        NegotiationRepository negotiations, PharmacyRepository pharmacies) {
         this.orders = orders; this.items = items; this.events = events;
         this.drugs = drugs; this.users = users; this.shifts = shifts;
         this.complaints = complaints; this.insurance = insurance;
+        this.negotiations = negotiations; this.pharmacies = pharmacies;
     }
 
     // ============================================================
@@ -192,6 +196,8 @@ public class OrderService {
     @Transactional
     public DispenseOrder review(User pharmacist, Long orderId, ReviewReq req) {
         DispenseOrder o = mustGet(orderId);
+        if (hasPendingNegotiation(o))
+            throw new ApiException("存在待患者确认的缺药替代协商，患者确认前不能审方");
         if (prescriptionExpired(o)) {
             // 阻断不通过则本次事务不产生状态变更；过期事实在提交时已记录 EXPIRED 事件
             throw new ApiException("处方已过有效期（有效至 " + o.getPrescriptionValidUntil()
@@ -354,6 +360,8 @@ public class OrderService {
     @Transactional
     public DispenseOrder runInsurance(User actor, Long orderId) {
         DispenseOrder o = mustGet(orderId);
+        if (hasPendingNegotiation(o))
+            throw new ApiException("缺药替代尚待患者确认，不能进行医保核验");
         if (prescriptionExpired(o))
             throw new ApiException("处方已过有效期，不能进行医保核验与结算");
         if (o.getPharmacistSignedAt() == null)
@@ -465,6 +473,8 @@ public class OrderService {
     @Transactional
     public DispenseOrder pay(User cashier, Long orderId, PayReq req) {
         DispenseOrder o = mustGet(orderId);
+        if (hasPendingNegotiation(o))
+            throw new ApiException("缺药替代尚待患者确认，客服/收银不能安排付款");
         if (prescriptionExpired(o))
             throw new ApiException("处方已过有效期，不能结算收费");
         if (!"WAIT_PAYMENT".equals(o.getStatus()))
@@ -485,6 +495,235 @@ public class OrderService {
                         + "、慢病额度 " + money(o.getChronicPay()) + "、夜间服务费 " + money(o.getNightFee())
                         + "。继续出库", cashier, "WAIT_PAYMENT", "PAID");
         return o;
+    }
+
+    // ============================================================
+    // 缺药替代协商（药师发起 → 患者确认 → 接受替代/拒绝并推荐药房）
+    // ============================================================
+
+    /** 同成分、同剂型、不同规格的可替代候选（须有库存），并标注医保目录/价格差异。 */
+    @Transactional(readOnly = true)
+    public List<Map<String, Object>> substitutionCandidates(Long orderId, Long itemId, User viewer) {
+        DispenseOrder o = mustGet(orderId);
+        requireActorAccess(o, viewer);
+        OrderItem target = items.findById(itemId).orElseThrow(() -> new ApiException("明细不存在"));
+        if (!target.getOrder().getId().equals(o.getId())) throw new ApiException("明细不属于该配药单");
+        Drug origin = target.getDrug();
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Drug d : drugs.findAll()) {
+            if (d.getId().equals(origin.getId())) continue;
+            if (d.getStock() <= 0 || d.getStock() < target.getQuantity()) continue;
+            if (origin.getIngredient() == null || !origin.getIngredient().equals(d.getIngredient())) continue;
+            if (origin.getDosageForm() == null || !origin.getDosageForm().equals(d.getDosageForm())) continue;
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("drugId", d.getId());
+            m.put("name", d.getName());
+            m.put("spec", d.getSpec());
+            m.put("manufacturer", d.getManufacturer());
+            m.put("price", d.getPrice());
+            m.put("stock", d.getStock());
+            m.put("batchNo", d.getBatchNo());
+            m.put("expiryDate", d.getExpiryDate());
+            m.put("insuranceCatalog", d.getInsuranceCatalog());
+            m.put("ingredient", d.getIngredient());
+            m.put("dosageForm", d.getDosageForm());
+            m.put("sameIngredient", true);
+            m.put("sameDosageForm", true);
+            m.put("catalogDiff", !java.util.Objects.equals(origin.getInsuranceCatalog(), d.getInsuranceCatalog()));
+            m.put("insuranceDiffNote", catalogDiffNote(origin, d));
+            result.add(m);
+        }
+        return result;
+    }
+
+    /** 药师发现原处方药库存不足，发起替代协商（单据暂停，等待患者确认）。 */
+    @Transactional
+    public SubstitutionNegotiation startNegotiation(User pharmacist, Long orderId, NegotiateReq req) {
+        DispenseOrder o = mustGet(orderId);
+        requireOnDutyPharmacist(pharmacist);
+        if (List.of("COMPLETED", "CANCELLED", "OFFLINE_REFERRAL", "DELIVERING", "DELIVERED").contains(o.getStatus()))
+            throw new ApiException("当前状态(" + o.getStatus() + ")不能发起替代协商");
+        // 同一明细存在待确认协商时不得重复发起
+        for (SubstitutionNegotiation n : negotiations.findByOrderOrderByCreatedAtAsc(o)) {
+            if ("PENDING".equals(n.getStatus()) && n.getItem().getId().equals(req.itemId()))
+                throw new ApiException("该药品已有待患者确认的替代协商");
+        }
+        OrderItem item = items.findById(req.itemId()).orElseThrow(() -> new ApiException("处方明细不存在"));
+        if (!item.getOrder().getId().equals(o.getId())) throw new ApiException("明细不属于该配药单");
+        Drug origin = item.getDrug();
+        Drug candidate = drugs.findById(req.replacementDrugId())
+                .orElseThrow(() -> new ApiException("替代药品不存在"));
+        // 硬性条件：同成分、同剂型、不同规格（同 ID 无意义）、库存充足
+        if (candidate.getId().equals(origin.getId()))
+            throw new ApiException("替代药不能与原药相同");
+        if (origin.getIngredient() == null || !origin.getIngredient().equals(candidate.getIngredient()))
+            throw new ApiException("替代药必须与原药为同一活性成分：" + origin.getIngredient());
+        if (origin.getDosageForm() == null || !origin.getDosageForm().equals(candidate.getDosageForm()))
+            throw new ApiException("替代药必须与原药为同一剂型：" + origin.getDosageForm());
+        if (candidate.getStock() < item.getQuantity())
+            throw new ApiException("替代药《" + candidate.getName() + "》库存不足");
+        if (candidate.getSpec().equals(origin.getSpec()))
+            throw new ApiException("替代协商针对不同规格药品；同规格请直接配发");
+        // 剂量或服药频次变化时，药师必须补充说明
+        boolean changed = req.dosageChanged() || req.frequencyChanged();
+        if (changed && (req.pharmacistDosageNote() == null || req.pharmacistDosageNote().isBlank()))
+            throw new ApiException("替代会改变剂量或服药频次，药师必须补充剂量换算与服药频次说明");
+        if (req.doctorReachable() == null || !List.of("YES", "NO", "UNKNOWN").contains(req.doctorReachable()))
+            throw new ApiException("请记录急诊医生是否可联系（YES/NO/UNKNOWN）");
+
+        SubstitutionNegotiation n = new SubstitutionNegotiation();
+        n.setOrder(o);
+        n.setItem(item);
+        n.setPharmacist(pharmacist);
+        n.setCandidateDrugId(candidate.getId());
+        n.setCandidateName(candidate.getName());
+        n.setCandidateSpec(candidate.getSpec());
+        n.setCandidateBatchNo(candidate.getBatchNo());
+        n.setCandidatePrice(candidate.getPrice());
+        n.setCandidateCatalog(candidate.getInsuranceCatalog());
+        n.setIngredient(candidate.getIngredient());
+        n.setDosageForm(candidate.getDosageForm());
+        n.setInsuranceCatalogDiff(catalogDiffNote(origin, candidate));
+        n.setDosageChanged(req.dosageChanged());
+        n.setFrequencyChanged(req.frequencyChanged());
+        n.setPharmacistDosageNote(req.pharmacistDosageNote());
+        n.setDoctorReachable(req.doctorReachable());
+        n.setDoctorContactNote(req.doctorContactNote());
+        n.setLastDoseTaken(req.lastDoseTaken());
+        n.setLastDoseNote(req.lastDoseNote());
+        n.setStatus("PENDING");
+        negotiations.save(n);
+
+        item.setFulfillStatus("NEGOTIATING");
+        pause(o, "等待患者确认缺药替代", pharmacist);
+        List<String> change = new ArrayList<>();
+        if (req.dosageChanged()) change.add("单次剂量变化");
+        if (req.frequencyChanged()) change.add("服药频次变化");
+        StringJoiner reason = new StringJoiner("；");
+        reason.add("原药《" + origin.getName() + "》" + origin.getSpec() + "（" + origin.getInsuranceCatalog()
+                + "类，¥" + origin.getPrice() + "）库存不足，药师提出同成分同剂型不同规格替代：《"
+                + candidate.getName() + "》" + candidate.getSpec() + "（" + candidate.getInsuranceCatalog()
+                + "类，¥" + candidate.getPrice() + "，批号" + candidate.getBatchNo() + "）");
+        reason.add("医保目录差异：" + catalogDiffNote(origin, candidate));
+        reason.add(change.isEmpty() ? "剂量与服药频次不变" : "存在" + String.join("、", change)
+                + "，药师说明：" + req.pharmacistDosageNote());
+        reason.add("医生可联系：" + doctorText(req.doctorReachable())
+                + (req.doctorContactNote() != null ? "（" + req.doctorContactNote() + "）" : ""));
+        reason.add("患者上一剂服用情况：" + (req.lastDoseTaken() ? "已服用" : "未服用")
+                + (req.lastDoseNote() != null ? "（" + req.lastDoseNote() + "）" : ""));
+        reason.add("单据暂停，须经患者/家属确认接受后，客服与收银方可继续安排付款和配送；拒绝则提供附近可购原药药房");
+        recordEvent(o, "NEGOTIATE", "PAUSE", reason.toString(), pharmacist, null, "PAUSED");
+        return n;
+    }
+
+    /** 患者（或客服代患者）接受/拒绝替代。 */
+    @Transactional
+    public SubstitutionNegotiation decideNegotiation(User actor, Long orderId, Long negotiationId,
+                                                     NegotiationDecisionReq req) {
+        DispenseOrder o = mustGet(orderId);
+        requireActorAccess(o, actor);
+        SubstitutionNegotiation n = negotiations.findById(negotiationId)
+                .orElseThrow(() -> new ApiException("协商记录不存在"));
+        if (!n.getOrder().getId().equals(o.getId())) throw new ApiException("协商不属于该配药单");
+        if (!"PENDING".equals(n.getStatus())) throw new ApiException("该协商已完成确认");
+
+        if (req.accepted()) {
+            Drug candidate = drugs.findById(n.getCandidateDrugId())
+                    .orElseThrow(() -> new ApiException("替代药品已下架"));
+            if (candidate.getStock() < n.getItem().getQuantity())
+                throw new ApiException("替代药库存已不足，无法确认接受");
+            OrderItem item = n.getItem();
+            item.setFulfillStatus("SUBSTITUTED");
+            item.setFulfilledDrugName(candidate.getName());
+            item.setFulfilledDrugId(candidate.getId());
+            item.setFulfilledUnitPrice(candidate.getPrice());
+            item.setFulfilledCatalog(candidate.getInsuranceCatalog());
+            StringJoiner note = new StringJoiner("；");
+            note.add("患者确认接受替代：" + item.getDrug().getName() + "(" + item.getDrug().getSpec() + ") → "
+                    + candidate.getName() + "(" + candidate.getSpec() + ")");
+            note.add("医保目录差异：" + n.getInsuranceCatalogDiff());
+            if (n.isDosageChanged() || n.isFrequencyChanged())
+                note.add("剂量/频次按药师说明执行：" + n.getPharmacistDosageNote());
+            note.add("医生可联系：" + doctorText(n.getDoctorReachable()) + "；上一剂"
+                    + (n.isLastDoseTaken() ? "已服用" : "未服用"));
+            item.setReviewNote((item.getReviewNote() == null ? "" : item.getReviewNote() + "；") + note);
+            if (candidate.isColdChain()) o.setColdChainRequired(true);
+            n.setStatus("ACCEPTED");
+            n.setDecidedBy(actor);
+            n.setDecidedAt(LocalDateTime.now());
+            // 恢复到暂停前环节继续（通常为审方前）
+            String to = o.getPrevStatus() != null ? o.getPrevStatus() : "SUBMITTED";
+            o.setStatus(to);
+            o.setDecision("CONTINUE");
+            o.setPrevStatus(null);
+            // 若此前已完成医保/费用核算则重算（审方前发起时费用尚未生成）
+            if ("APPROVED".equals(o.getInsuranceStatus())) {
+                var r = insurance.verify(o.getInsuranceNo(), o.isChronicFlag(), chronicUsedDefault, chronicQuota);
+                calculateAmounts(o, r);
+            }
+            recordEvent(o, "NEGOTIATE_ACCEPT", "CONTINUE",
+                    "患者/家属（" + actor.getDisplayName() + "）确认接受替代药《" + candidate.getName() + "》"
+                            + candidate.getSpec() + "。医保目录差异、剂量/频次变化说明、医生可联系性、上一剂服用情况"
+                            + "均已记录在案；客服/收银可继续安排付款与配送", actor, "PAUSED", to);
+            return n;
+        }
+
+        // 拒绝：必须保留拒绝原因 + 附近可购原药的 24 小时药房建议
+        if (req.rejectionReason() == null || req.rejectionReason().isBlank())
+            throw new ApiException("拒绝替代时必须填写拒绝原因");
+        List<Pharmacy> nearby = pharmacies.findByOpen24hTrueOrderByDistanceKmAsc().stream().limit(3).toList();
+        List<Map<String, Object>> snapshot = new ArrayList<>();
+        StringJoiner sj = new StringJoiner("；");
+        for (Pharmacy p : nearby) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("name", p.getName());
+            m.put("address", p.getAddress());
+            m.put("phone", p.getPhone());
+            m.put("distanceKm", p.getDistanceKm());
+            snapshot.add(m);
+            sj.add(p.getName() + "（" + p.getAddress() + "，电话" + p.getPhone() + "）");
+        }
+        try {
+            n.setNearbyPharmacySuggestion(new com.fasterxml.jackson.databind.ObjectMapper()
+                    .writeValueAsString(snapshot));
+        } catch (Exception ignored) {
+            n.setNearbyPharmacySuggestion(sj.toString());
+        }
+        n.setStatus("REJECTED");
+        n.setRejectionReason(req.rejectionReason());
+        n.setDecidedBy(actor);
+        n.setDecidedAt(LocalDateTime.now());
+        n.getItem().setFulfillStatus("PENDING");
+        // 拒绝后单据保持暂停：原药无库存，由药师/客服改移除药品或引导线下
+        recordEvent(o, "NEGOTIATE_REJECT", "PAUSE",
+                "患者/家属拒绝替代药《" + n.getCandidateName() + "》。拒绝原因：" + req.rejectionReason()
+                        + "。附近可购原药的 24 小时药房建议：" + sj
+                        + "。本单继续暂停，由药师/客服协助移除该药品后配剩余药品，或引导患者线下购药/复诊",
+                actor, null, "PAUSED");
+        return n;
+    }
+
+    private boolean hasPendingNegotiation(DispenseOrder o) {
+        return negotiations.findByOrderOrderByCreatedAtAsc(o).stream()
+                .anyMatch(n -> "PENDING".equals(n.getStatus()));
+    }
+
+    private String catalogDiffNote(Drug origin, Drug candidate) {
+        String base = "原药" + nz(origin.getInsuranceCatalog(), "否") + "类 → 替代药"
+                + nz(candidate.getInsuranceCatalog(), "否") + "类";
+        if (java.util.Objects.equals(origin.getInsuranceCatalog(), candidate.getInsuranceCatalog())) {
+            return base + "，医保目录等级一致，报销目录待遇不变（单价不同，费用按替代药价格计算）";
+        }
+        return base + "，医保目录等级不同：乙类/自费药品需先行自付一部分，统筹报销金额可能减少，"
+                + "费用差额与报销变化将在结算时按替代药重新拆分并告知患者";
+    }
+
+    private String doctorText(String s) {
+        return switch (nz(s, "UNKNOWN")) {
+            case "YES" -> "可联系";
+            case "NO" -> "无法联系";
+            default -> "暂未联系";
+        };
     }
 
     // ============================================================
@@ -611,6 +850,8 @@ public class OrderService {
     @Transactional
     public DispenseOrder outbound(User warehouse, Long orderId) {
         DispenseOrder o = mustGet(orderId);
+        if (hasPendingNegotiation(o))
+            throw new ApiException("缺药替代尚待患者确认，不能出库与配送");
         if (prescriptionExpired(o))
             throw new ApiException("处方已过有效期，不能出库");
         if (!"PAID".equals(o.getStatus())) throw new ApiException("仅已支付待出库状态可出库");
@@ -623,7 +864,10 @@ public class OrderService {
         for (OrderItem it : its) {
             if ("REMOVED".equals(it.getFulfillStatus())) continue;
             Drug pick;
-            if ("SUBSTITUTED".equals(it.getFulfillStatus())) {
+            if ("SUBSTITUTED".equals(it.getFulfillStatus()) && it.getFulfilledDrugId() != null) {
+                pick = drugs.findById(it.getFulfilledDrugId())
+                        .orElseThrow(() -> new ApiException("替代药品目录记录缺失"));
+            } else if ("SUBSTITUTED".equals(it.getFulfillStatus())) {
                 pick = drugs.findByNameContaining(it.getFulfilledDrugName()).stream()
                         .filter(d -> d.getName().equals(it.getFulfilledDrugName())).findFirst()
                         .orElse(it.getDrug());
@@ -719,9 +963,11 @@ public class OrderService {
     public DispenseOrder resumeOrder(User actor, Long orderId, String reason) {
         DispenseOrder o = mustGet(orderId);
         requireActorAccess(o, actor);
-        // 过期处方即便被暂停也不允许恢复推进
+        // 过期处方、待患者确认替代协商均不允许人工恢复推进
         if (prescriptionExpired(o))
             throw new ApiException("处方已过有效期，不能恢复配药，须重新开具处方或转线下复诊");
+        if (hasPendingNegotiation(o))
+            throw new ApiException("缺药替代尚待患者确认，不能直接恢复，请先由患者接受或拒绝替代");
         resume(actor, o, reason, "RESUME");
         return o;
     }
@@ -882,9 +1128,16 @@ public class OrderService {
         m.put("order", o);
         m.put("items", items.findByOrderOrderByIdAsc(o));
         m.put("events", events.findByOrderOrderByCreatedAtAscIdAsc(o));
+        m.put("negotiations", negotiations.findByOrderOrderByCreatedAtAsc(o));
         m.put("complaints", complaints.findAll().stream()
                 .filter(c -> c.getOrder().getId().equals(o.getId())).toList());
         return m;
+    }
+
+    /** 附近 24 小时药房（拒绝替代时推荐原药购药渠道）。 */
+    @Transactional(readOnly = true)
+    public List<Pharmacy> nearbyPharmacies(User viewer) {
+        return pharmacies.findByOpen24hTrueOrderByDistanceKmAsc();
     }
 
     /**

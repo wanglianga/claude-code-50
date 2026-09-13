@@ -93,12 +93,16 @@
                 </div>
               </template>
             </el-table-column>
-            <el-table-column v-if="canWarehouse" label="缺药处置" width="130">
+            <el-table-column v-if="canWarehouse" label="缺药处置" width="210">
               <template #default="{row}">
                 <el-button link type="primary" :disabled="!['PAID','PICKING','PAUSED'].includes(data.order.status)
-                    || row.fulfillStatus==='REMOVED'" @click="openSub(row)">替代</el-button>
+                    || row.fulfillStatus==='REMOVED' || row.fulfillStatus==='NEGOTIATING'" @click="openSub(row)">直接替代</el-button>
                 <el-button link type="danger" :disabled="!['PAID','PICKING','PAUSED'].includes(data.order.status)
                     || row.fulfillStatus==='REMOVED'" @click="removeItem(row)">移除</el-button>
+                <el-button v-if="canPharmacist" link type="warning"
+                    :disabled="['COMPLETED','CANCELLED','OFFLINE_REFERRAL','DELIVERING'].includes(data.order.status)
+                        || row.fulfillStatus==='NEGOTIATING' || hasPendingNego"
+                    @click="openNego(row)">替代协商</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -118,6 +122,54 @@
             <el-button type="warning" @click="doReturn">处方不清·退回补充</el-button>
             <el-button @click="doContact">联系患者确认关键药品</el-button>
             <el-button type="warning" plain @click="doctorDialog = true">急诊医生电话核实</el-button>
+          </div>
+        </el-card>
+
+        <!-- 缺药替代协商 -->
+        <el-card shadow="never" class="block">
+          <template #header><div class="card-h"><el-icon><ChatDotRound /></el-icon>
+            缺药替代协商（同成分·同剂型·不同规格，患者确认后方可结算配送）</div></template>
+          <el-empty v-if="!data.negotiations?.length" :image-size="50" description="暂无替代协商" />
+          <div v-for="n in data.negotiations" :key="n.id" class="nego"
+               :class="'nego-'+n.status">
+            <div class="nego-head">
+              <b>{{ n.item?.drug?.name }} {{ n.item?.drug?.spec }}</b>
+              <el-icon><Right /></el-icon>
+              <b>{{ n.candidateName }} {{ n.candidateSpec }}</b>
+              <el-tag size="small" :type="n.status==='ACCEPTED'?'success':n.status==='REJECTED'?'danger':'warning'">
+                {{ n.status==='PENDING'?'待患者确认':n.status==='ACCEPTED'?'患者已接受':'患者已拒绝' }}
+              </el-tag>
+              <el-tag v-if="n.item?.drug?.insuranceCatalog !== n.candidateCatalog" size="small" type="danger">
+                医保 {{ n.item?.drug?.insuranceCatalog }}→{{ n.candidateCatalog }}
+              </el-tag>
+            </div>
+            <div class="hint white-pre">{{ n.insuranceCatalogDiff }}</div>
+            <div class="nego-grid">
+              <div><label>成分/剂型：</label>{{ n.ingredient }} · {{ n.dosageForm }}（同成分同剂型）</div>
+              <div><label>剂量/频次：</label>
+                <el-tag v-if="n.dosageChanged" size="small" type="danger">剂量变化</el-tag>
+                <el-tag v-if="n.frequencyChanged" size="small" type="danger">频次变化</el-tag>
+                <span v-if="!n.dosageChanged && !n.frequencyChanged">无变化</span>
+              </div>
+              <div class="white-pre" v-if="n.pharmacistDosageNote"><label>药师说明：</label>{{ n.pharmacistDosageNote }}</div>
+              <div><label>医生可联系：</label>{{ doctorText(n.doctorReachable) }}
+                <span v-if="n.doctorContactNote" class="hint">（{{ n.doctorContactNote }}）</span></div>
+              <div><label>上一剂：</label>{{ n.lastDoseTaken ? '患者已服用' : '患者未服用' }}
+                <span v-if="n.lastDoseNote" class="hint">（{{ n.lastDoseNote }}）</span></div>
+              <div v-if="n.status==='REJECTED'" class="white-pre"><label>拒绝原因：</label>{{ n.rejectionReason }}</div>
+            </div>
+            <div v-if="n.status==='REJECTED' && n.nearbyPharmacySuggestion" class="nearby">
+              <b>附近可购原药的 24 小时药房：</b>
+              <div v-for="(p, i) in parsePharmacies(n.nearbyPharmacySuggestion)" :key="i" class="hint">
+                · {{ p.name }} {{ p.address }} 电话 {{ p.phone }}
+              </div>
+            </div>
+            <div v-if="n.status==='PENDING' && canDecideNego" class="actions">
+              <el-popconfirm title="确认接受该替代药？剂量/频次按药师说明执行" @confirm="acceptNego(n)">
+                <template #reference><el-button type="primary">患者接受替代（继续付款配送）</el-button></template>
+              </el-popconfirm>
+              <el-button type="danger" plain @click="openReject(n)">患者拒绝（记录原因+推荐药房）</el-button>
+            </div>
           </div>
         </el-card>
 
@@ -346,6 +398,79 @@
       </template>
     </el-dialog>
 
+    <!-- 药师发起替代协商 -->
+    <el-dialog v-model="negoDialog" title="发起缺药替代协商（待患者确认）" width="640px">
+      <el-alert type="warning" :closable="false" show-icon style="margin-bottom:10px"
+        title="仅可提出同成分、同剂型、不同规格的替代药；发起后单据暂停，患者确认接受后客服/收银才能继续付款与配送。" />
+      <el-form :model="nego" label-width="120px">
+        <el-form-item label="原处方药">{{ nego.originName }} {{ nego.originSpec }}</el-form-item>
+        <el-form-item label="替代候选">
+          <el-select v-model="nego.replacementDrugId" filterable placeholder="选择同成分同剂型候选" style="width:100%"
+                     @change="onCandidate">
+            <el-option v-for="c in candidates" :key="c.drugId"
+              :label="c.name + ' ' + c.spec + '（' + c.insuranceCatalog + '类 ¥' + c.price + ' 存' + c.stock + '）'"
+              :value="c.drugId">
+              <span>{{ c.name }} {{ c.spec }}</span>
+              <el-tag size="small" style="margin:0 6px">{{ c.insuranceCatalog }}类</el-tag>
+              <el-tag v-if="c.catalogDiff" size="small" type="danger">医保差异</el-tag>
+              <span class="hint">¥{{ c.price }} 批号{{ c.batchNo }}</span>
+            </el-option>
+          </el-select>
+        </el-form-item>
+        <el-alert v-if="selectedCandidate" :title="selectedCandidate.insuranceDiffNote" type="error"
+                  :closable="false" style="margin-bottom:10px" />
+        <el-form-item label="剂量/频次变化">
+          <el-checkbox v-model="nego.dosageChanged">单次剂量变化</el-checkbox>
+          <el-checkbox v-model="nego.frequencyChanged">服药频次变化</el-checkbox>
+        </el-form-item>
+        <el-form-item label="药师剂量说明" :required="nego.dosageChanged || nego.frequencyChanged">
+          <el-input v-model="nego.pharmacistDosageNote" type="textarea" :rows="2"
+            :placeholder="(nego.dosageChanged||nego.frequencyChanged)
+              ? '变化时必填：如原15mg/袋每次2袋，现25mg/袋每次1.2袋(30mg)，每日仍2次'
+              : '剂量频次无变化可留空'" />
+        </el-form-item>
+        <el-form-item label="医生是否可联系">
+          <el-radio-group v-model="nego.doctorReachable">
+            <el-radio value="YES">可联系</el-radio>
+            <el-radio value="NO">无法联系</el-radio>
+            <el-radio value="UNKNOWN">暂未联系</el-radio>
+          </el-radio-group>
+          <el-input v-model="nego.doctorContactNote" placeholder="联系情况备注（如已电话确认换药）"
+                    style="margin-top:6px" />
+        </el-form-item>
+        <el-form-item label="上一剂服用">
+          <el-radio-group v-model="nego.lastDoseTaken">
+            <el-radio :value="true">已服用</el-radio>
+            <el-radio :value="false">未服用</el-radio>
+          </el-radio-group>
+          <el-input v-model="nego.lastDoseNote" placeholder="服用时间/剂量备注" style="margin-top:6px" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="negoDialog=false">取消</el-button>
+        <el-button type="primary" @click="doStartNego">发起协商（单据暂停待确认）</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 患者拒绝替代 -->
+    <el-dialog v-model="rejectDialog" title="患者拒绝替代" width="500px">
+      <el-form label-width="92px">
+        <el-form-item label="拒绝原因" required>
+          <el-input v-model="reject.rejectionReason" type="textarea" :rows="3"
+            placeholder="如：孩子只接受原规格颗粒/不接受乙类报销差异/担心剂量换算误差" />
+        </el-form-item>
+        <el-form-item label="附近药房">
+          <div v-for="p in pharmacies" :key="p.id" class="hint" style="line-height:1.9">
+            · {{ p.name }} {{ p.address }} 电话 {{ p.phone }}
+          </div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="rejectDialog=false">取消</el-button>
+        <el-button type="danger" @click="doReject">确认拒绝并保留原因</el-button>
+      </template>
+    </el-dialog>
+
     <!-- 改地址 -->
     <el-dialog v-model="addressDialog" title="修改配送信息（全员同单可见）" width="480px">
       <el-form :model="addr" label-width="80px">
@@ -403,6 +528,19 @@ const deliverDialog = ref(false)
 const deliver = reactive({ coldPhotoPath: '', temperature: 4.5, signedBy: '', signRelation: '本人', medicationReminder: '' })
 const addressDialog = ref(false)
 const addr = reactive({ address: '', contactPhone: '', recipient: '', note: '' })
+
+// 缺药替代协商
+const negoDialog = ref(false)
+const candidates = ref([])
+const nego = reactive({ itemId: null, originName: '', originSpec: '', replacementDrugId: null,
+  dosageChanged: false, frequencyChanged: false, pharmacistDosageNote: '',
+  doctorReachable: 'UNKNOWN', doctorContactNote: '', lastDoseTaken: false, lastDoseNote: '' })
+const rejectDialog = ref(false)
+const reject = reactive({ negotiationId: null, rejectionReason: '' })
+const pharmacies = ref([])
+const canDecideNego = computed(() => ['PATIENT','CUSTOMER_SERVICE','ADMIN'].includes(role.value))
+const hasPendingNego = computed(() => (data.value?.negotiations || []).some(n => n.status === 'PENDING'))
+const selectedCandidate = computed(() => candidates.value.find(c => c.drugId === nego.replacementDrugId))
 
 async function load() {
   try {
@@ -517,6 +655,50 @@ async function doAddress() {
   ElMessage.success('配送信息已变更并同步全员')
 }
 
+// 缺药替代协商
+const doctorText = s => ({ YES: '可联系', NO: '无法联系', UNKNOWN: '暂未联系' }[s] || s)
+function parsePharmacies(raw) {
+  try { return JSON.parse(raw) } catch { return [] }
+}
+async function openNego(row) {
+  Object.assign(nego, { itemId: row.id, originName: row.drug.name, originSpec: row.drug.spec,
+    replacementDrugId: null, dosageChanged: false, frequencyChanged: false, pharmacistDosageNote: '',
+    doctorReachable: 'UNKNOWN', doctorContactNote: '', lastDoseTaken: false, lastDoseNote: '' })
+  candidates.value = (await api.get(`/api/orders/${route.params.id}/items/${row.id}/candidates`)).data
+  if (!candidates.value.length) {
+    ElMessage.info('该药品暂无同成分同剂型且有库存的替代候选')
+    return
+  }
+  negoDialog.value = true
+}
+function onCandidate() {}
+async function doStartNego() {
+  if (!nego.replacementDrugId) return ElMessage.warning('请选择替代候选')
+  if ((nego.dosageChanged || nego.frequencyChanged) && !nego.pharmacistDosageNote.trim())
+    return ElMessage.error('剂量/频次变化时药师必须补充说明')
+  await post('/negotiations', { ...nego })
+  negoDialog.value = false
+  ElMessage.success('已发起替代协商，单据暂停，等待患者确认')
+}
+async function acceptNego(n) {
+  await api.post(`/api/orders/${route.params.id}/negotiations/${n.id}/decision`,
+    { accepted: true, rejectionReason: '' })
+  await load()
+  ElMessage.success('患者已接受替代，可继续审方、付款与配送')
+}
+function openReject(n) {
+  Object.assign(reject, { negotiationId: n.id, rejectionReason: '' })
+  rejectDialog.value = true
+}
+async function doReject() {
+  if (!reject.rejectionReason.trim()) return ElMessage.error('请填写拒绝原因')
+  await api.post(`/api/orders/${route.params.id}/negotiations/${reject.negotiationId}/decision`,
+    { accepted: false, rejectionReason: reject.rejectionReason })
+  rejectDialog.value = false
+  await load()
+  ElMessage.warning('已记录拒绝原因与附近药房建议，单据保持暂停等待处置')
+}
+
 // 通用决策
 async function pause() {
   const { value: reason } = await ElMessageBox.prompt('为什么暂停配药？', '暂停',
@@ -558,14 +740,18 @@ async function fileComplaint(category) {
 const fmt = t => t ? t.replace('T', ' ').slice(0, 16) : ''
 const num = v => Number(v || 0).toFixed(2)
 const valueMissing = v => v === undefined || v === null || v.trim() === ''
-const fulfillName = s => ({ PENDING: '待审', CONFIRMED: '按方配发', SUBSTITUTED: '替代配发', REMOVED: '已移除' }[s])
-const fulfillType = s => ({ PENDING: 'info', CONFIRMED: 'success', SUBSTITUTED: 'warning', REMOVED: 'danger' }[s])
+const fulfillName = s => ({ PENDING: '待审', CONFIRMED: '按方配发', SUBSTITUTED: '替代配发',
+  REMOVED: '已移除', NEGOTIATING: '替代协商中' }[s])
+const fulfillType = s => ({ PENDING: 'info', CONFIRMED: 'success', SUBSTITUTED: 'warning',
+  REMOVED: 'danger', NEGOTIATING: 'warning' }[s])
 const insType = s => ({ APPROVED: 'success', REJECTED: 'danger', ERROR: 'danger', ROLLED_BACK: 'warning' }[s] || 'info')
 const stageName = s => ({ REVIEW: '审方', OUTBOUND: '出库批号', PAYMENT: '医保支付', DELIVERY: '配送签收' }[s] || s)
 const timelineType = d => ({ CONTINUE: 'success', PAUSE: 'danger', OFFLINE: 'info' }[d] || 'primary')
 const EVENT_NAMES = {
   SUBMIT: '提交/补充', EXPIRED: '处方过期拦截', REVIEW: '药师审方', RETURN: '退回补充', CONTACT: '联系患者',
-  DOCTOR_VERIFY: '医生电话核实', INSURANCE: '医保核验', ROLLBACK: '医保回退',
+  DOCTOR_VERIFY: '医生电话核实', NEGOTIATE: '替代协商发起', NEGOTIATE_ACCEPT: '患者接受替代',
+  NEGOTIATE_REJECT: '患者拒绝替代',
+  INSURANCE: '医保核验', ROLLBACK: '医保回退',
   PAY: '收银支付', SUBSTITUTE: '缺药替代/移除', ADDRESS_CHANGE: '改配送信息',
   COLD_CHAIN: '冷链处置', ISSUE: '出库', DELIVER: '签收归档', HANDOVER: '值班交接',
   COMPLAINT: '投诉反馈', PAUSE: '暂停', RESUME: '恢复', OFFLINE: '转线下'
@@ -575,6 +761,7 @@ const eventTypeName = t => EVENT_NAMES[t] || t
 onMounted(async () => {
   await load()
   drugs.value = await api.get('/api/drugs')
+  try { pharmacies.value = (await api.get('/api/pharmacies')).data } catch {}
 })
 </script>
 
@@ -604,4 +791,12 @@ onMounted(async () => {
 .decision-PAUSE { background: #fef2f2; color: #b91c1c; }
 .decision-OFFLINE { background: #f1f3f7; color: #556; }
 .reason { font-size: 13px; margin-top: 4px; color: #3c4356; }
+.nego { border: 1px solid #e3e8f2; border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; background: #fbfcff; }
+.nego-ACCEPTED { border-color: #b7ebc6; background: #f6fef9; }
+.nego-REJECTED { border-color: #f3c2c2; background: #fff7f7; }
+.nego-PENDING { border-color: #f0d39a; background: #fffbF2; }
+.nego-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.nego-grid { font-size: 13px; line-height: 1.9; color: #3c4356; margin-top: 4px; }
+.nego-grid label { color: #8a93a5; }
+.nearby { margin-top: 8px; padding: 8px 10px; background: #fff4e5; border-radius: 6px; font-size: 13px; }
 </style>

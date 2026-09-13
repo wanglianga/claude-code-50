@@ -43,4 +43,18 @@ public final class Requests {
     public record DecisionReq(String reason) {}
 
     public record AddressReq(String address, String contactPhone, String recipient, String note) {}
+
+    /** 药师发起缺药替代协商。 */
+    public record NegotiateReq(
+            Long itemId, Long replacementDrugId,
+            boolean dosageChanged, boolean frequencyChanged,
+            String pharmacistDosageNote,
+            String doctorReachable, String doctorContactNote,
+            boolean lastDoseTaken, String lastDoseNote
+    ) {}
+
+    /** 患者接受/拒绝替代。 */
+    public record NegotiationDecisionReq(
+            boolean accepted, String rejectionReason, String chosenPharmacyNote
+    ) {}
 }

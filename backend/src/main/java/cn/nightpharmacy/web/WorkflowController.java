@@ -69,6 +69,13 @@ public class WorkflowController extends BaseController {
         return Map.of("success", true, "data", orderService.handover(u, req));
     }
 
+    // ---------------- 附近 24 小时药房 ----------------
+    @GetMapping("/pharmacies")
+    public Object pharmacies(HttpServletRequest request) {
+        currentUser(request);
+        return Map.of("success", true, "data", orderService.nearbyPharmacies(currentUser(request)));
+    }
+
     // ---------------- 投诉台 ----------------
     @GetMapping("/complaints")
     public List<Complaint> listComplaints(@RequestParam(required = false) String status,

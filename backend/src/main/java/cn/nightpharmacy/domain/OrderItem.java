@@ -41,6 +41,9 @@ public class OrderItem {
     @Column(length = 80)
     private String fulfilledDrugName;
 
+    /** 实际配发药品 ID（替代协商接受后定位出库用） */
+    private Long fulfilledDrugId;
+
     @Column(precision = 12, scale = 2)
     private BigDecimal unitPrice;
 
@@ -74,6 +77,8 @@ public class OrderItem {
     public void setFulfillStatus(String s) { this.fulfillStatus = s; }
     public String getFulfilledDrugName() { return fulfilledDrugName; }
     public void setFulfilledDrugName(String s) { this.fulfilledDrugName = s; }
+    public Long getFulfilledDrugId() { return fulfilledDrugId; }
+    public void setFulfilledDrugId(Long id) { this.fulfilledDrugId = id; }
     public BigDecimal getUnitPrice() { return unitPrice; }
     public void setUnitPrice(BigDecimal p) { this.unitPrice = p; }
     public BigDecimal getFulfilledUnitPrice() { return fulfilledUnitPrice; }

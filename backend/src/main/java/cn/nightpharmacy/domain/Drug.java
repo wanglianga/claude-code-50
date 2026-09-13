@@ -31,6 +31,14 @@ public class Drug {
     @Column(nullable = false, length = 16)
     private String controlCategory = "RX";
 
+    /** 通用名/活性成分（同成分替代匹配依据） */
+    @Column(length = 80)
+    private String ingredient;
+
+    /** 剂型（片剂/胶囊剂/口服混悬液/注射液/颗粒剂/散剂等，须同剂型方可协商替代） */
+    @Column(length = 30)
+    private String dosageForm;
+
     /** 是否需要 2-8℃ 冷藏 */
     @Column(nullable = false)
     private boolean coldChain = false;
@@ -73,6 +81,10 @@ public class Drug {
     public void setPrice(BigDecimal price) { this.price = price; }
     public String getControlCategory() { return controlCategory; }
     public void setControlCategory(String controlCategory) { this.controlCategory = controlCategory; }
+    public String getIngredient() { return ingredient; }
+    public void setIngredient(String ingredient) { this.ingredient = ingredient; }
+    public String getDosageForm() { return dosageForm; }
+    public void setDosageForm(String dosageForm) { this.dosageForm = dosageForm; }
     public boolean isColdChain() { return coldChain; }
     public void setColdChain(boolean coldChain) { this.coldChain = coldChain; }
     public Integer getStock() { return stock; }
