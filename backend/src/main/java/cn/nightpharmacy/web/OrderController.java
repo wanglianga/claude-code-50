@@ -47,8 +47,7 @@ public class OrderController extends BaseController {
 
     @GetMapping("/{id}")
     public Map<String, Object> detail(@PathVariable Long id, HttpServletRequest request) {
-        currentUser(request);
-        return Map.of("success", true, "data", service.detail(id));
+        return Map.of("success", true, "data", service.detail(id, currentUser(request)));
     }
 
     // ---------------- 药师：审方/退回/联系患者/医生核实/暂停/恢复/转线下 ----------------

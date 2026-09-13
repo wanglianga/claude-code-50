@@ -105,7 +105,16 @@ public class OrderService {
         warnings.forEach(sj::add);
         recordEvent(o, "SUBMIT", "CONTINUE", sj.toString(), patient, null, "SUBMITTED");
 
-        // 管制药品超量 / 无值班药师等硬性问题：暂停或转线下，均记录原因
+        // 硬性问题按优先级阻断：处方过期 → 无值班药师 → 管制药品超量
+        if (warnings.stream().anyMatch(w -> w.contains("处方已过有效期"))) {
+            pause(o, "处方已过有效期", patient);
+            recordEvent(o, "EXPIRED", "PAUSE",
+                    "处方已过有效期（有效至 " + o.getPrescriptionValidUntil()
+                            + "），按规定过期处方不得审方、医保核验与结算；本单暂停配药，"
+                            + "须由医生重新开具处方后重新提交，或改为线下复诊",
+                    patient, "SUBMITTED", "PAUSED");
+            return o;
+        }
         if (warnings.stream().anyMatch(w -> w.contains("无夜间值班药师"))) {
             offline(o, "当前无夜间值班药师在岗，无法完成处方审核，建议改往 24 小时急诊药房或线下复诊", patient);
             recordEvent(o, "OFFLINE", "OFFLINE",
@@ -183,6 +192,11 @@ public class OrderService {
     @Transactional
     public DispenseOrder review(User pharmacist, Long orderId, ReviewReq req) {
         DispenseOrder o = mustGet(orderId);
+        if (prescriptionExpired(o)) {
+            // 阻断不通过则本次事务不产生状态变更；过期事实在提交时已记录 EXPIRED 事件
+            throw new ApiException("处方已过有效期（有效至 " + o.getPrescriptionValidUntil()
+                    + "），不能进入审方，须请医生重新开具处方或改线下复诊");
+        }
         if (!List.of("SUBMITTED", "PHARMACIST_REVIEW", "DOCTOR_VERIFY", "PAUSED").contains(o.getStatus())
                 && !"INSURANCE_CHECK".equals(o.getStatus())) {
             throw new ApiException("当前状态(" + o.getStatus() + ")不能审方");
@@ -288,6 +302,9 @@ public class OrderService {
     @Transactional
     public DispenseOrder patientResubmit(User patient, Long orderId, String newImagePath, String supplement) {
         DispenseOrder o = mustGet(orderId);
+        requireActorAccess(o, patient);
+        if (prescriptionExpired(o))
+            throw new ApiException("处方已过有效期，补充材料也不能继续，请请医生重新开具处方");
         if (!"PENDING_SUPPLEMENT".equals(o.getStatus()))
             throw new ApiException("仅退回待补充状态可补充材料");
         if (newImagePath != null && !newImagePath.isBlank()) o.setPrescriptionImagePath(newImagePath);
@@ -337,6 +354,8 @@ public class OrderService {
     @Transactional
     public DispenseOrder runInsurance(User actor, Long orderId) {
         DispenseOrder o = mustGet(orderId);
+        if (prescriptionExpired(o))
+            throw new ApiException("处方已过有效期，不能进行医保核验与结算");
         if (o.getPharmacistSignedAt() == null)
             throw new ApiException("药师尚未完成审方签名");
         o.setStatus("INSURANCE_CHECK");
@@ -446,6 +465,8 @@ public class OrderService {
     @Transactional
     public DispenseOrder pay(User cashier, Long orderId, PayReq req) {
         DispenseOrder o = mustGet(orderId);
+        if (prescriptionExpired(o))
+            throw new ApiException("处方已过有效期，不能结算收费");
         if (!"WAIT_PAYMENT".equals(o.getStatus()))
             throw new ApiException("当前状态(" + o.getStatus() + ")不能支付");
         if (o.getTotalAmount() == null || o.getSelfPay() == null)
@@ -546,6 +567,7 @@ public class OrderService {
     @Transactional
     public DispenseOrder changeAddress(User actor, Long orderId, AddressReq req) {
         DispenseOrder o = mustGet(orderId);
+        requireActorAccess(o, actor);
         if (List.of("COMPLETED", "CANCELLED", "OFFLINE_REFERRAL").contains(o.getStatus()))
             throw new ApiException("已终结单据不能修改地址");
         String old = nz(o.getAddress(), "") + "/" + nz(o.getRecipient(), "") + "/" + nz(o.getContactPhone(), "");
@@ -567,6 +589,8 @@ public class OrderService {
         o.setRiderColdCapable(req.capable());
         if (req.capable()) {
             if ("PAUSED".equals(o.getStatus())) {
+                if (prescriptionExpired(o))
+                    throw new ApiException("处方已过有效期，不能恢复配送");
                 resume(rider, o, "骑手已配备冷链箱(2-8℃)，恢复配药", "COLD_CHAIN");
             } else {
                 recordEvent(o, "COLD_CHAIN", "CONTINUE",
@@ -587,6 +611,8 @@ public class OrderService {
     @Transactional
     public DispenseOrder outbound(User warehouse, Long orderId) {
         DispenseOrder o = mustGet(orderId);
+        if (prescriptionExpired(o))
+            throw new ApiException("处方已过有效期，不能出库");
         if (!"PAID".equals(o.getStatus())) throw new ApiException("仅已支付待出库状态可出库");
         if (o.isColdChainRequired() && o.isNeedsDelivery()
                 && o.getRiderColdCapable() != null && !o.getRiderColdCapable()) {
@@ -683,6 +709,7 @@ public class OrderService {
     @Transactional
     public DispenseOrder pauseOrder(User actor, Long orderId, String reason) {
         DispenseOrder o = mustGet(orderId);
+        requireActorAccess(o, actor);
         pause(o, reason, actor);
         recordEvent(o, "PAUSE", "PAUSE", "人工暂停配药：" + reason, actor, null, "PAUSED");
         return o;
@@ -691,6 +718,10 @@ public class OrderService {
     @Transactional
     public DispenseOrder resumeOrder(User actor, Long orderId, String reason) {
         DispenseOrder o = mustGet(orderId);
+        requireActorAccess(o, actor);
+        // 过期处方即便被暂停也不允许恢复推进
+        if (prescriptionExpired(o))
+            throw new ApiException("处方已过有效期，不能恢复配药，须重新开具处方或转线下复诊");
         resume(actor, o, reason, "RESUME");
         return o;
     }
@@ -698,6 +729,7 @@ public class OrderService {
     @Transactional
     public DispenseOrder offlineReferral(User actor, Long orderId, String reason) {
         DispenseOrder o = mustGet(orderId);
+        requireActorAccess(o, actor);
         offline(o, reason, actor);
         recordEvent(o, "OFFLINE", "OFFLINE", "终止线上配药，改为线下复诊：" + reason,
                 actor, null, "OFFLINE_REFERRAL");
@@ -782,6 +814,7 @@ public class OrderService {
     @Transactional
     public Complaint fileComplaint(User reporter, Long orderId, ComplaintReq req) {
         DispenseOrder o = mustGet(orderId);
+        requireActorAccess(o, reporter);
         Complaint c = new Complaint();
         c.setOrder(o);
         c.setReporter(reporter);
@@ -833,8 +866,18 @@ public class OrderService {
     // 查询辅助
     // ============================================================
     @Transactional(readOnly = true)
-    public Map<String, Object> detail(Long orderId) {
-        DispenseOrder o = mustGet(orderId);
+    public Map<String, Object> detail(Long id, User viewer) {
+        DispenseOrder o = mustGet(id);
+        requireActorAccess(o, viewer);
+        return assembleDetail(o);
+    }
+
+    @Transactional(readOnly = true)
+    public Map<String, Object> detail(Long id) {
+        return assembleDetail(mustGet(id));
+    }
+
+    private Map<String, Object> assembleDetail(DispenseOrder o) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("order", o);
         m.put("items", items.findByOrderOrderByIdAsc(o));
@@ -842,6 +885,23 @@ public class OrderService {
         m.put("complaints", complaints.findAll().stream()
                 .filter(c -> c.getOrder().getId().equals(o.getId())).toList());
         return m;
+    }
+
+    /**
+     * 患者数据隔离：患者角色只能访问本人配药单；员工角色（药师/收银/仓管/骑手/客服/管理员）
+     * 为协同处理可访问全部单据，但各操作接口另有角色权限控制。
+     */
+    private void requireActorAccess(DispenseOrder o, User u) {
+        if (u != null && "PATIENT".equals(u.getRole())
+                && (o.getPatient() == null || !o.getPatient().getId().equals(u.getId()))) {
+            throw new ApiException(403, "无权访问他人的配药单");
+        }
+    }
+
+    /** 处方是否已过有效期（急诊处方 7 日有效）。 */
+    private boolean prescriptionExpired(DispenseOrder o) {
+        return o.getPrescriptionValidUntil() != null
+                && LocalDate.now().isAfter(o.getPrescriptionValidUntil());
     }
 
     @Transactional(readOnly = true)

@@ -2,6 +2,8 @@
   <div v-if="data">
     <!-- 抬头 -->
     <el-card shadow="never" class="head-card">
+      <el-alert v-if="expired" type="error" show-icon :closable="false" style="margin-bottom:10px"
+        title="处方已过有效期：按规定不得审方、医保核验与结算；须请医生重新开具处方后重新提交，或改为线下复诊。" />
       <div class="head">
         <div>
           <div class="title-line">
@@ -384,6 +386,13 @@ const canStaff = computed(() => role.value !== 'PATIENT')
 const canAddress = computed(() => ['PATIENT','CUSTOMER_SERVICE','RIDER','ADMIN'].includes(role.value)
   && !['COMPLETED','CANCELLED','OFFLINE_REFERRAL'].includes(data.value?.order.status))
 
+// 处方是否过期（急诊处方 7 日有效）
+const expired = computed(() => {
+  const until = data.value?.order?.prescriptionValidUntil
+  if (!until) return false
+  return new Date(until + 'T23:59:59') < new Date(new Date().toDateString())
+})
+
 const doctorDialog = ref(false)
 const doctor = reactive({ doctorName: '', phone: '', note: '' })
 const payDialog = ref(false)
@@ -396,8 +405,16 @@ const addressDialog = ref(false)
 const addr = reactive({ address: '', contactPhone: '', recipient: '', note: '' })
 
 async function load() {
-  const res = await api.get('/api/orders/' + route.params.id)
-  data.value = res.data
+  try {
+    const res = await api.get('/api/orders/' + route.params.id)
+    data.value = res.data
+  } catch (e) {
+    if (e.response?.status === 403 || e.response?.status === 404) {
+      setTimeout(() => location.hash = '#/orders', 600)
+      return
+    }
+    throw e
+  }
   Object.assign(addr, {
     address: data.value.order.address || '', contactPhone: data.value.order.contactPhone || '',
     recipient: data.value.order.recipient || '', note: ''
@@ -547,7 +564,7 @@ const insType = s => ({ APPROVED: 'success', REJECTED: 'danger', ERROR: 'danger'
 const stageName = s => ({ REVIEW: '审方', OUTBOUND: '出库批号', PAYMENT: '医保支付', DELIVERY: '配送签收' }[s] || s)
 const timelineType = d => ({ CONTINUE: 'success', PAUSE: 'danger', OFFLINE: 'info' }[d] || 'primary')
 const EVENT_NAMES = {
-  SUBMIT: '提交/补充', REVIEW: '药师审方', RETURN: '退回补充', CONTACT: '联系患者',
+  SUBMIT: '提交/补充', EXPIRED: '处方过期拦截', REVIEW: '药师审方', RETURN: '退回补充', CONTACT: '联系患者',
   DOCTOR_VERIFY: '医生电话核实', INSURANCE: '医保核验', ROLLBACK: '医保回退',
   PAY: '收银支付', SUBSTITUTE: '缺药替代/移除', ADDRESS_CHANGE: '改配送信息',
   COLD_CHAIN: '冷链处置', ISSUE: '出库', DELIVER: '签收归档', HANDOVER: '值班交接',

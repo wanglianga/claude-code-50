@@ -32,7 +32,8 @@
             <el-form-item label="处方开具日期">
               <el-date-picker v-model="form.prescriptionDate" type="date" value-format="YYYY-MM-DD"
                               :disabled-date="future" placeholder="选择日期" />
-              <span class="hint">急诊处方有效期 7 天，超期无法审方</span>
+              <span class="hint">急诊处方有效期 7 天（至 {{ validUntil }}），过期处方将被拦截不能配药</span>
+              <el-tag v-if="rxExpired" type="danger" size="small" style="margin-left:8px">该处方已过期，无法提交</el-tag>
             </el-form-item>
             <el-form-item label="医保凭证号">
               <el-input v-model="form.insuranceNo" placeholder="18位医保电子凭证号" style="width:300px" />
@@ -133,6 +134,10 @@ const form = reactive({
 
 const drugMap = computed(() => Object.fromEntries(drugs.value.map(d => [d.id, d])))
 const selected = computed(() => form.items.map(i => drugMap.value[i.drugId]).filter(Boolean))
+const validUntil = computed(() => form.prescriptionDate
+  ? new Date(new Date(form.prescriptionDate).getTime() + 7 * 864e5).toISOString().slice(0, 10) : '')
+const rxExpired = computed(() => form.prescriptionDate
+  && new Date(validUntil.value + 'T23:59:59') < new Date(new Date().toDateString()))
 const drugLabel = d => `${d.name} ${d.spec||''}`
 const nearExpiry = d => d.expiryDate && d.expiryDate <= add90()
 function add90() {
@@ -154,6 +159,7 @@ async function uploadRx(opt) {
 async function submit() {
   if (!form.items.some(i => i.drugId)) return ElMessage.warning('请至少选择一种药品')
   if (!form.prescriptionImagePath) return ElMessage.warning('请上传电子处方图片')
+  if (rxExpired.value) return ElMessage.error('处方已过有效期（至 ' + validUntil.value + '），请请医生重新开具处方')
   submitting.value = true
   try {
     const res = await api.post('/api/orders', form)
